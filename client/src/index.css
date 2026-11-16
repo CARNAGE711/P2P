@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Slim scrollbars for the transfer log */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: theme('colors.slate.700') transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background-color: theme('colors.slate.700');
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Overscroll looks bad on a dark app */
+html {
+  color-scheme: dark;
+}

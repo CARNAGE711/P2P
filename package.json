@@ -1,0 +1,15 @@
+{
+  "name": "beamdrop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AirDrop-style P2P file transfer over WebRTC — React + Node.js + Socket.io signaling",
+  "scripts": {
+    "install-all": "npm install && npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

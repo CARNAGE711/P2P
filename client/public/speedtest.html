@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BeamDrop · Network Speed Test</title>
+    <style>
+      body {
+        margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        background: #020617; color: #e2e8f0; font-family: system-ui, sans-serif; text-align: center;
+      }
+      .card { max-width: 480px; padding: 32px; }
+      h1 { font-size: 18px; font-weight: 600; color: #94a3b8; margin: 0 0 24px; }
+      #result { font-size: 56px; font-weight: 700; color: #818cf8; margin: 16px 0; font-variant-numeric: tabular-nums; }
+      #detail { font-size: 13px; color: #64748b; min-height: 18px; }
+      button {
+        margin-top: 24px; padding: 12px 32px; font-size: 16px; font-weight: 600; color: white;
+        background: linear-gradient(to right, #4f46e5, #6366f1); border: none; border-radius: 10px; cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; }
+      .hint { margin-top: 20px; font-size: 12px; color: #475569; line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>BeamDrop network speed test (50 MB download)</h1>
+      <div id="result">—</div>
+      <div id="detail">measures TCP throughput to the PC over the network</div>
+      <button id="btn" onclick="start()">Start test</button>
+      <p class="hint">
+        &gt; 3 MB/s → TCP relay will make BeamDrop fast on this network<br />
+        ~ 0.6 MB/s → the corporate routing caps everything (use the phone hotspot)
+      </p>
+    </div>
+    <script>
+      async function start() {
+        const btn = document.getElementById('btn');
+        const out = document.getElementById('result');
+        const detail = document.getElementById('detail');
+        btn.disabled = true;
+        out.textContent = 'Testing…';
+        detail.textContent = 'downloading 50 MB…';
+        const t0 = performance.now();
+        let bytes = 0;
+        try {
+          const res = await fetch('/speedfile/speedtest.bin', { cache: 'no-store' });
+          const reader = res.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            bytes += value.length;
+            const secs = (performance.now() - t0) / 1000;
+            if (secs > 0.2) {
+              out.textContent = ((bytes / 1048576 / secs)).toFixed(2) + ' MB/s';
+              detail.textContent =
+                (bytes / 1048576).toFixed(0) + ' MB in ' + secs.toFixed(1) + 's';
+            }
+          }
+          const secs = (performance.now() - t0) / 1000;
+          out.textContent = (bytes / 1048576 / secs).toFixed(2) + ' MB/s';
+          detail.textContent = 'finished — ' + (bytes / 1048576).toFixed(0) + ' MB in ' + secs.toFixed(1) + 's';
+        } catch (e) {
+          out.textContent = 'Failed';
+          detail.textContent = e.message;
+        }
+        btn.disabled = false;
+      }
+    </script>
+  </head>
+</html>

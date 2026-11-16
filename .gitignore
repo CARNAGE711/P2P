@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output (rebuilt with `npm run build`)
+client/dist/
+
+# Speed-test fixture (50 MB, regenerable with tools/make-speedtest)
+tools/speedtest.bin
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
