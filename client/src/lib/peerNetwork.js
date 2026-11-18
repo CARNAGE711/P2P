@@ -45,11 +45,19 @@ const STALL_TIMEOUT = 2000; // no bytes for 2 s → speed shows 0
  * TCP flows at full speed. When a direct transfer samples below the
  * threshold, the remaining chunks switch to the relay transport (the same
  * framed protocol, carried over the Socket.io websocket). */
-const RELAY_CHUNK_SIZE = 256 * 1024; // per-relay-message payload
-const RELAY_WINDOW_CHUNKS = 24; // max unacked chunks in flight (~6 MB)
+const RELAY_CHUNK_SIZE = 2 * 1024 * 1024; // per-relay-message payload (2 MB)
+const RELAY_WINDOW_CHUNKS = 200; // max unacked chunks per stream (~400 MB)
 const RELAY_SWITCH_SPEED = 2 * 1024 * 1024; // < 2 MB/s → engage relay
 const RELAY_MIN_SENT = 2 * 1024 * 1024; // sample at least 2 MB directly first
 const RELAY_MIN_REMAIN = 16 * 1024 * 1024; // only worth it for big remainders
+
+/* Parallel segmented transfer: files ≥ SEGMENT_MIN are split into up to
+ * PARALLEL_STREAMS segments, each streamed over its own relay sub-stream so
+ * the sender can saturate a fast LAN / phone hotspot (single-stream TCP has
+ * per-connection overhead; parallel segments keep the pipe full). */
+const SEGMENT_MIN = 100 * 1024 * 1024; // use segmentation above 100 MB
+const SEGMENT_SIZE = 256 * 1024 * 1024; // 256 MB per segment
+const PARALLEL_STREAMS = 4; // max concurrent relay sub-streams per file
 
 /* ─── Small helpers ───────────────────────────────────────────────────────── */
 
@@ -272,6 +280,310 @@ export default class PeerNetwork {
     return key;
   }
 
+  /** Get-or-create an ordered array of child segment keys for a parent. */
+  _segmentChildren(t) {
+    return (t.segments || []).map((k) => this.transfers.get(k)).filter(Boolean);
+  }
+
+  /** Aggregate received bytes across a segmented parent's children. */
+  _segmentAggregatedReceived(t) {
+    return this._segmentChildren(t).reduce((sum, c) => sum + (c.received || 0), 0);
+  }
+
+  /** Assemble all segment blobs into the parent's final Blob + object URL. */
+  _assembleSegments(t) {
+    const children = this._segmentChildren(t);
+    const segmentBlobs = [];
+    for (const child of children) {
+      segmentBlobs.push(new Blob(child.parts || [], { type: child.mime || '' }));
+      child.parts = null; // free per-segment chunk memory
+    }
+    const blob = new Blob(segmentBlobs, { type: t.mime || 'application/octet-stream' });
+    t.parts = null;
+    t.url = URL.createObjectURL(blob);
+    t.received = t.size;
+    t.status = 'done';
+    t.speed = averageSpeed(t);
+    this.onToast?.({ kind: 'received', key: t.key, peerName: this.peers.get(t.peerId)?.name, fileName: t.name });
+    this._emit();
+  }
+
+  /**
+   * Send a file to a peer. Returns the internal transfer key, or throws if
+   * the data channel is not open yet.
+   *
+   * @param {object} [opts] `{ transport: 'relay' }` forces the TCP relay
+   *   transport for this transfer (otherwise it starts on the direct
+   *   DataChannel and may auto-switch to relay when the link is slow).
+   *   `{ parallel: true }` forces segmented parallel relay (used automatically
+   *   for files ≥ 100 MB).
+   */
+  sendFile(peerId, file, opts = {}) {
+    const peer = this.peers.get(peerId);
+    if (!peer) throw new Error('Peer not found');
+    const useRelay = opts.transport === 'relay' && !!this._socket?.connected;
+    const forceParallel = opts.parallel === true || file.size >= SEGMENT_MIN;
+    if (!useRelay && !forceParallel && (!peer.dc || peer.dc.readyState !== 'open')) {
+      throw new Error('Peer is not connected yet');
+    }
+
+    // Large files → split into parallel segments, each its own relay sub-stream.
+    if (forceParallel && this._socket?.connected) {
+      return this._sendFileSegmented(peerId, file);
+    }
+
+    if (!useRelay && (!peer.dc || peer.dc.readyState !== 'open')) {
+      throw new Error('Peer is not connected yet');
+    }
+
+    // Transfer ids are scoped to one channel (4-byte prefix on every chunk),
+    // while `key` is globally unique inside this client.
+    const remoteId = ++peer.outgoingSeq;
+    const key = `t${++this._seq}`;
+
+    const transfer = {
+      key,
+      remoteId,
+      peerId,
+      direction: 'send',
+      name: file.name,
+      size: file.size,
+      mime: file.type || '',
+      sent: 0,
+      received: 0,
+      status: 'transferring',
+      speed: 0,
+      startedAt: performance.now(),
+      lastSample: { time: performance.now(), bytes: 0 },
+      fileRef: file, // kept in the closure, never copied into memory
+      parts: null,
+      url: null,
+      error: null,
+      /** 'dc' | 'switching' | 'relay' — which transport carries the chunks */
+      transport: useRelay ? 'relay' : 'dc',
+      relaySentChunks: 0,
+      relayAckedChunks: 0,
+      waiters: [], // relay flow-control resolvers (internal)
+    };
+    this.transfers.set(key, transfer);
+
+    // 1) announce the file, 2) start the chunk pump.
+    const meta = JSON.stringify({
+      t: 'meta', id: remoteId, name: file.name, size: file.size, mime: file.type,
+    });
+    if (useRelay) {
+      this._socket.emit('relay-chunk', { to: peerId, frame: meta });
+      // Put the receiver in ACK mode immediately (same ordering guarantee as
+      // the chunks that follow: per-socket, in-order delivery).
+      this._socket.emit('relay-chunk', {
+        to: peerId,
+        frame: JSON.stringify({ t: 'relay-on', id: remoteId }),
+      });
+      this._pumpRelay(peerId, key);
+    } else {
+      peer.dc.send(meta);
+      this._pump(peerId, key);
+    }
+    this._emit();
+    return key;
+  }
+
+  /**
+   * Send a large file split into N parallel segments, each streamed over its
+   * own relay sub-stream. The receiver reassembles them in order into one
+   * Blob once every segment finishes.
+   */
+  async _sendFileSegmented(peerId, file) {
+    const peer = this.peers.get(peerId);
+    if (!peer) throw new Error('Peer not found');
+    if (!this._socket?.connected) throw new Error('Relay connection lost');
+
+    const segSize = SEGMENT_SIZE;
+    const segCount = Math.min(PARALLEL_STREAMS, Math.ceil(file.size / segSize));
+    const parentRemoteId = ++peer.outgoingSeq;
+    const parentKey = `t${++this._seq}`;
+    const childRemoteIds = [];
+    const childKeys = [];
+    const segmentBounds = [];
+
+    for (let i = 0; i < segCount; i++) {
+      const start = i * segSize;
+      const end = Math.min(start + segSize, file.size);
+      const childRemoteId = ++peer.outgoingSeq;
+      const childKey = `t${++this._seq}`;
+      childRemoteIds.push(childRemoteId);
+      childKeys.push(childKey);
+      segmentBounds.push({ start, end });
+
+      this.transfers.set(childKey, {
+        key: childKey,
+        remoteId: childRemoteId,
+        peerId,
+        direction: 'send',
+        name: file.name,
+        size: end - start, // segment byte length
+        mime: file.type || '',
+        sent: start, // start offset within the file
+        received: 0,
+        status: 'transferring',
+        speed: 0,
+        startedAt: performance.now(),
+        lastSample: { time: performance.now(), bytes: 0 },
+        fileRef: file,
+        parts: null,
+        url: null,
+        error: null,
+        transport: 'relay',
+        parentKey,
+        segmentIndex: i,
+        segmentStart: start,
+        segmentEnd: end,
+        relaySentChunks: 0,
+        relayAckedChunks: 0,
+        waiters: [],
+      });
+    }
+
+    const parent = {
+      key: parentKey,
+      remoteId: parentRemoteId,
+      peerId,
+      direction: 'send',
+      name: file.name,
+      size: file.size,
+      mime: file.type || '',
+      sent: 0,
+      received: 0,
+      status: 'transferring',
+      speed: 0,
+      startedAt: performance.now(),
+      lastSample: { time: performance.now(), bytes: 0 },
+      fileRef: file,
+      parts: null,
+      url: null,
+      error: null,
+      transport: 'relay',
+      segments: childKeys, // child keys, in order
+      segmentCount: segCount,
+      completedSegments: 0,
+    };
+    this.transfers.set(parentKey, parent);
+
+    // Announce: parent meta lists every child remoteId so the receiver can
+    // create matching child records and route chunks by remoteId.
+    const meta = JSON.stringify({
+      t: 'meta',
+      id: parentRemoteId,
+      name: file.name,
+      size: file.size,
+      mime: file.type,
+      segmented: true,
+      segments: childRemoteIds,
+      segmentSize: segSize,
+    });
+    this._socket.emit('relay-chunk', { to: peerId, frame: meta });
+
+    // Put every child into ACK mode, then pump all segments in parallel.
+    for (let i = 0; i < segCount; i++) {
+      this._socket.emit('relay-chunk', {
+        to: peerId,
+        frame: JSON.stringify({ t: 'relay-on', id: childRemoteIds[i] }),
+      });
+      this._pumpRelaySegment(peerId, childKeys[i], segmentBounds[i].start, segmentBounds[i].end);
+    }
+
+    this._emit();
+    return parentKey;
+  }
+
+  /**
+   * Relay pump for one segment of a parallel transfer. Reads only the
+   * segment's byte range [start, end) of the source file.
+   */
+  async _pumpRelaySegment(peerId, key, start, end) {
+    const t = this.transfers.get(key);
+    const peer = this.peers.get(peerId);
+    if (!t || !peer) return;
+    const socket = this._socket;
+    let offset = start;
+
+    try {
+      while (offset < end && t.status === 'transferring' && t.transport === 'relay') {
+        if (!socket?.connected) throw new Error('Relay connection lost');
+
+        // Watchdog: unacked chunks with no ack for 8 s → fall back to a
+        // single stream so the file still completes instead of freezing.
+        if (
+          t.relaySentChunks > t.relayAckedChunks &&
+          performance.now() - (t.lastRelayAckAt ?? t.startedAt) > 8000
+        ) {
+          throw new Error('Relay segment stalled — no acknowledgements');
+        }
+
+        // Credit window: wait until the receiver ACKs enough chunks.
+        while (t.relaySentChunks - t.relayAckedChunks >= RELAY_WINDOW_CHUNKS) {
+          await Promise.race([
+            new Promise((resolve) => t.waiters.push(resolve)),
+            new Promise((r) => setTimeout(r, 2000)),
+          ]);
+          if (t.status !== 'transferring' || t.transport !== 'relay') return;
+          if (
+            t.relaySentChunks > t.relayAckedChunks &&
+            performance.now() - (t.lastRelayAckAt ?? t.startedAt) > 8000
+          ) {
+            throw new Error('Relay segment stalled — no acknowledgements');
+          }
+        }
+
+        const chunkEnd = Math.min(offset + RELAY_CHUNK_SIZE, end);
+        const chunk = await readFileAsArrayBuffer(t.fileRef.slice(offset, chunkEnd));
+        const framed = new Uint8Array(4 + chunk.byteLength);
+        new DataView(framed.buffer).setUint32(0, t.remoteId);
+        framed.set(new Uint8Array(chunk), 4);
+        socket.emit('relay-chunk', { to: peerId, frame: framed.buffer });
+
+        t.relaySentChunks++;
+        offset = chunkEnd;
+        t.sent = offset;
+        this._sampleSpeed(t);
+        this._emitThrottled();
+      }
+
+      if (t.status === 'transferring' && t.transport === 'relay') {
+        socket.emit('relay-chunk', {
+          to: peerId,
+          frame: JSON.stringify({ t: 'done', id: t.remoteId }),
+        });
+        this._segmentChildDone(peerId, t);
+      }
+    } catch (err) {
+      if (t.status === 'transferring' && t.transport === 'relay') {
+        t.status = 'failed';
+        t.error = err.message;
+        t.speed = 0;
+        this._flushWaiters(t);
+        this._emit();
+      }
+    }
+  }
+
+  /** Mark one segment of a parent transfer done; assemble when all finish. */
+  _segmentChildDone(peerId, child) {
+    if (child.status !== 'transferring') return;
+    child.status = 'done';
+    child.speed = averageSpeed(child);
+
+    const parent = child.parentKey ? this.transfers.get(child.parentKey) : null;
+    if (!parent) return;
+    parent.completedSegments = (parent.completedSegments || 0) + 1;
+
+    if (parent.completedSegments >= parent.segmentCount) {
+      this._assembleSegments(parent);
+    } else {
+      this._emitThrottled();
+    }
+  }
+
   /** Cancel an active transfer (works for both directions). */
   cancelTransfer(key) {
     const t = this.transfers.get(key);
@@ -289,6 +601,19 @@ export default class PeerNetwork {
       });
     } else if (peer?.dc?.readyState === 'open') {
       peer.dc.send(JSON.stringify({ t: 'abort', id: t.remoteId }));
+    }
+
+    // Segmented parent: cancel every child segment as well.
+    if (t.segments) {
+      for (const childKey of t.segments) {
+        const child = this.transfers.get(childKey);
+        if (child && ['transferring', 'receiving'].includes(child.status)) {
+          child.status = 'aborted';
+          child.speed = 0;
+          child.parts = null;
+        }
+      }
+      t.segments.forEach((k) => this.transfers.delete(k));
     }
 
     t.status = 'aborted';
@@ -499,6 +824,77 @@ export default class PeerNetwork {
       case 'meta': {
         if (peer.incoming.has(msg.id)) return; // duplicate frame, ignore
         const key = `t${++this._seq}`;
+
+        // Segmented transfer: the sender announces one parent id plus N
+        // child remoteIds. We create a parent record + one child shell per
+        // segment, then route each binary chunk to its child by remoteId.
+        if (msg.segmented && Array.isArray(msg.segments)) {
+          const parentKey = `t${++this._seq}`;
+          const parent = {
+            key: parentKey,
+            remoteId: msg.id,
+            peerId,
+            direction: 'recv',
+            name: msg.name || 'file',
+            size: msg.size || 0,
+            mime: msg.mime || '',
+            sent: 0,
+            received: 0,
+            status: 'receiving',
+            speed: 0,
+            startedAt: performance.now(),
+            lastSample: { time: performance.now(), bytes: 0 },
+            parts: null,
+            url: null,
+            error: null,
+            transport: 'relay',
+            segments: [], // filled with child keys below
+            segmentCount: msg.segments.length,
+            completedSegments: 0,
+          };
+          this.transfers.set(parentKey, parent);
+          peer.incoming.set(msg.id, parentKey);
+
+          const childKeys = [];
+          for (let i = 0; i < msg.segments.length; i++) {
+            const childRemoteId = msg.segments[i];
+            const childKey = `t${++this._seq}`;
+            const segSize = i === msg.segments.length - 1
+              ? Math.max(0, (msg.size || 0) - i * (msg.segmentSize || 0))
+              : msg.segmentSize || 0;
+            const child = {
+              key: childKey,
+              remoteId: childRemoteId,
+              peerId,
+              direction: 'recv',
+              name: msg.name || 'file',
+              size: segSize,
+              mime: msg.mime || '',
+              sent: 0,
+              received: 0,
+              status: 'receiving',
+              speed: 0,
+              startedAt: performance.now(),
+              lastSample: { time: performance.now(), bytes: 0 },
+              parts: [],
+              url: null,
+              error: null,
+              transport: 'relay',
+              parentKey,
+              segmentIndex: i,
+              relayRecvCount: 0,
+            };
+            this.transfers.set(childKey, child);
+            peer.incoming.set(childRemoteId, childKey);
+            childKeys.push(childKey);
+          }
+          parent.segments = childKeys;
+
+          this.onToast?.({ kind: 'incoming', peerName: peer.name, fileName: parent.name });
+          this._emit();
+          break;
+        }
+
         const record = {
           key,
           remoteId: msg.id,
@@ -532,7 +928,14 @@ export default class PeerNetwork {
       case 'done': {
         const key = peer.incoming.get(msg.id);
         const t = key ? this.transfers.get(key) : null;
-        if (t && t.status === 'receiving') this._finishIncoming(peer, t);
+        if (!t) break;
+        // Segmented child 'done': just mark it done; the parent assembles
+        // when every segment reports in.
+        if (t.parentKey) {
+          this._segmentChildDone(peerId, t);
+          break;
+        }
+        if (t.status === 'receiving') this._finishIncoming(peer, t);
         break;
       }
 
@@ -982,12 +1385,26 @@ export default class PeerNetwork {
       };
     });
 
-    const transfers = Array.from(this.transfers.values()).map(
-      ({ parts, fileRef, lastSample, waiters, ...rest }) => ({
-        ...rest,
-        transferred: rest.direction === 'send' ? rest.sent : rest.received,
-      }),
-    );
+    const transfers = Array.from(this.transfers.values())
+      .map((t) => {
+        // Hide child segments — the parent represents the whole file in the UI.
+        if (t.parentKey) return null;
+        const { parts, fileRef, lastSample, waiters, ...rest } = t;
+        let transferred = rest.direction === 'send' ? rest.sent : rest.received;
+        if (rest.segments) {
+          transferred = rest.segments.reduce((sum, k) => {
+            const c = this.transfers.get(k);
+            if (!c) return sum;
+            if (rest.direction === 'send') {
+              // child.sent walks from segmentStart → segmentEnd; normalize to 0..segmentSize
+              return sum + (c.sent - (c.segmentStart ?? 0));
+            }
+            return sum + (c.received ?? 0);
+          }, 0);
+        }
+        return { ...rest, transferred };
+      })
+      .filter(Boolean);
 
     return {
       connected: !!this._socket?.connected,
